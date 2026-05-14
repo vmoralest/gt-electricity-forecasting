@@ -1,0 +1,12 @@
+# Datos fuente (archivos AMM, grandes)
+data/raw/
+
+# Archivos R temporales
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj.user
+
+# Quarto cache
+report/_freeze/
+report/.quarto/

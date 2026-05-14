@@ -1,0 +1,394 @@
+---
+title: "Pronóstico de la Demanda Eléctrica del Sistema Nacional Interconectado de Guatemala"
+subtitle: "Análisis exploratorio y modelos de series de tiempo (2016–2026)"
+author: "Victor Hugo Morales Trujillo"
+date: today
+date-format: "MMMM YYYY"
+lang: es
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-title: "Contenido"
+    number-sections: true
+    fig-align: center
+    fig-width: 9
+    fig-height: 5
+    code-fold: true
+    code-summary: "Ver código"
+    highlight-style: github
+    embed-resources: true   # HTML autocontenido (un solo archivo)
+
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+
+knitr:
+  opts_chunk:
+    out.width: "100%"
+---
+
+```{r setup}
+library(tidyverse)
+library(tsibble)
+library(fpp3)
+library(here)
+library(knitr)
+library(kableExtra)
+
+# Cargar datos procesados
+demanda_ts    <- readRDS(here("data", "processed", "demanda_ts.rds"))
+demanda_train <- demanda_ts |> filter_index("2016 Jan" ~ "2024 Dec")
+demanda_test  <- demanda_ts |> filter_index("2025 Jan" ~ "2025 Dec")
+
+# Cargar tablas de accuracy
+tabla_final <- read_csv(here("output", "tables", "final_evaluation.csv"),
+                        show_col_types = FALSE)
+```
+
+## Resumen ejecutivo {.unnumbered}
+
+::: {.callout-note appearance="minimal"}
+Este reporte analiza la demanda mensual de energía eléctrica del Sistema Nacional Interconectado (SNI) de Guatemala para el período 2016–2026, utilizando datos oficiales del Administrador del Mercado Mayorista (AMM). Se evaluaron seis modelos de pronóstico — cuatro benchmarks y dos familias de modelos estadísticos — bajo un esquema riguroso de validación hold-out y cross-validation temporal.
+
+**Resultado principal:** el modelo ARIMA seleccionado automáticamente por criterio AICc logra un RMSE de **29 GWh** y un MAPE de **2.08%** en el test set 2025, representando una mejora del **50.6%** sobre el benchmark SNAIVE. La demanda del SNI muestra una tendencia de crecimiento sostenido de ~4–5% anual, con estacionalidad estable y un único shock exógeno identificado (COVID-19, 2020).
+:::
+
+---
+
+## Introducción
+
+### Contexto del sector eléctrico guatemalteco
+
+Guatemala opera un mercado eléctrico liberalizado desde 1996, regulado por la Ley General de Electricidad. El **Sistema Nacional Interconectado (SNI)** integra la generación, transmisión y distribución de energía a nivel nacional, y es administrado por el **AMM (Administrador del Mercado Mayorista)**, entidad técnica responsable de la planificación del despacho de carga.
+
+La demanda eléctrica del SNI es un indicador macroeconómico relevante: refleja el crecimiento industrial, la expansión de cobertura residencial y los cambios en la estructura productiva del país. Entre 2016 y 2025, la demanda creció de ~830 GWh/mes a ~1,200 GWh/mes — un incremento acumulado superior al 45%.
+
+### Motivación del análisis
+
+Los pronósticos de demanda a corto y mediano plazo son insumos críticos para:
+
+- **Planificación de capacidad**: determinar cuándo y qué tecnología de generación incorporar
+- **Compras en el mercado spot**: optimizar las decisiones de adquisición de energía en el POE
+- **Política energética**: proyectar metas de cobertura y electrificación rural
+
+### Objetivo
+
+Construir y evaluar modelos de series de tiempo que pronostiquen la demanda mensual del SNI con horizonte de 12 meses, identificando el modelo con mejor desempeño predictivo fuera de muestra.
+
+---
+
+## Datos
+
+### Fuente y cobertura
+
+```{r tabla-datos}
+tibble(
+  Atributo = c("Fuente", "Serie", "Unidad", "Frecuencia",
+               "Período train", "Período test", "Total observaciones"),
+  Valor    = c("AMM — Despacho de Carga Ejecutado del SNI",
+               "DEMANDA S.N.I.",
+               "GWh (gigavatios-hora)",
+               "Mensual",
+               "Enero 2016 – Diciembre 2024 (108 meses)",
+               "Enero 2025 – Diciembre 2025 (12 meses)",
+               "120 meses")
+) |>
+  kable(col.names = c("", ""),
+        caption   = "Descripción del conjunto de datos") |>
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE, position = "left") |>
+  column_spec(1, bold = TRUE, width = "12em")
+```
+
+Los datos se obtuvieron de los archivos anuales de despacho ejecutado (`GM[año]0101.xls/xlsx`) disponibles en el portal del AMM. El proceso de importación y limpieza está documentado en `R/01_import_clean.R`.
+
+::: {.callout-tip title="Nota metodológica"}
+Los archivos del AMM presentan dos variantes de formato (anterior y posterior a 2021). El script de importación detecta y maneja ambas variantes automáticamente mediante búsqueda dinámica de la fila `DEMANDA S.N.I.`, sin depender de posiciones de fila fijas.
+:::
+
+---
+
+## Análisis exploratorio
+
+### Serie temporal completa
+
+```{r fig-timeplot, fig.cap="Demanda mensual del SNI 2016–2026. La banda roja indica el período de impacto de COVID-19 (marzo–diciembre 2020)."}
+include_graphics(here("output", "figures", "01_timeplot.png"))
+```
+
+La serie muestra tres características estructurales que guían la selección de modelos:
+
+1. **Tendencia creciente** sostenida a lo largo de todo el período
+2. **Estacionalidad anual** con patrón repetitivo visible
+3. **Outlier puntual** en 2020 (caída por COVID-19), seguido de recuperación completa en ~6 meses
+
+### Descomposición STL
+
+```{r fig-stl, fig.cap="Descomposición STL robusta de la demanda mensual. Los rectángulos grises a la izquierda indican la escala relativa de cada componente."}
+include_graphics(here("output", "figures", "02_stl_decomp.png"))
+```
+
+La descomposición STL robusta (`robust = TRUE`) separa los tres componentes sin que el outlier de COVID contamine la estimación de tendencia:
+
+```{r stl-stats}
+stl_fit <- demanda_ts |>
+  model(STL(demanda_gwh ~ trend(window = 13) + season(window = "periodic"),
+            robust = TRUE))
+
+comp <- stl_fit |> components()
+
+tibble(
+  Componente   = c("Tendencia (rango)", "Estacionalidad (amplitud pico-a-pico)",
+                   "Residuos (desv. estándar)"),
+  Valor        = c(
+    paste0(round(min(comp$trend, na.rm=T), 0), " – ",
+           round(max(comp$trend, na.rm=T), 0), " GWh"),
+    paste0(round(diff(range(comp$season_year, na.rm=T)), 0), " GWh"),
+    paste0(round(sd(comp$remainder, na.rm=T), 1), " GWh")
+  )
+) |>
+  kable(caption = "Magnitud de los componentes STL") |>
+  kable_styling(bootstrap_options = "striped", full_width = FALSE,
+                position = "left") |>
+  column_spec(1, bold = TRUE)
+```
+
+### Patrón estacional
+
+```{r fig-seasonal, fig.cap="Patrón estacional por año. Las líneas más oscuras corresponden a años más antiguos; las más claras, a años recientes."}
+include_graphics(here("output", "figures", "03_seasonal.png"))
+```
+
+El patrón estacional es **estructuralmente estable** a lo largo de los 10 años: caída en febrero, pico en marzo–mayo (verano guatemalteco, mayor actividad industrial y residencial), segundo pico en julio–agosto y descenso en noviembre. La separación vertical entre líneas refleja el crecimiento sostenido del nivel de demanda.
+
+```{r fig-subseries, fig.cap="Tendencia de cada mes por separado. La línea horizontal azul indica la media histórica del mes."}
+include_graphics(here("output", "figures", "04_subseries.png"))
+```
+
+### Crecimiento anual
+
+```{r fig-crecimiento, fig.cap="Variación porcentual de la demanda total anual respecto al año anterior."}
+include_graphics(here("output", "figures", "06_crecimiento_anual.png"))
+```
+
+```{r crec-stats}
+crec <- demanda_ts |>
+  as_tibble() |>
+  group_by(anio) |>
+  summarise(total = sum(demanda_gwh, na.rm = TRUE),
+            n     = sum(!is.na(demanda_gwh)), .groups = "drop") |>
+  filter(n == 12) |>
+  mutate(crec = (total / lag(total) - 1) * 100) |>
+  filter(!is.na(crec))
+
+tibble(
+  Período        = c("2017–2019 (pre-COVID)", "2020 (COVID-19)",
+                     "2021 (rebote)", "2022–2025 (post-COVID)"),
+  `Crec. promedio` = c(
+    paste0(round(mean(filter(crec, anio %in% 2017:2019)$crec), 1), "%"),
+    paste0(round(filter(crec, anio == 2020)$crec, 1), "%"),
+    paste0(round(filter(crec, anio == 2021)$crec, 1), "%"),
+    paste0(round(mean(filter(crec, anio %in% 2022:2025)$crec), 1), "%")
+  )
+) |>
+  kable(caption = "Tasas de crecimiento anual por período") |>
+  kable_styling(bootstrap_options = "striped", full_width = FALSE,
+                position = "left") |>
+  column_spec(1, bold = TRUE)
+```
+
+### Estructura de autocorrelación
+
+```{r fig-acf, fig.cap="ACF y PACF de la demanda mensual hasta lag 36. Las líneas punteadas azules indican los límites de significancia al 95%."}
+include_graphics(here("output", "figures", "05_acf_pacf.png"))
+```
+
+La ACF revela dos señales diagnósticas clave:
+
+- **Decaimiento lento** en todos los lags → serie no estacionaria, requiere diferenciación `d = 1`
+- **Pico significativo en lag 12** → componente estacional, requiere diferenciación estacional `D = 1`
+
+La PACF muestra spikes fuertes en los primeros lags (AR de corto plazo) y un spike en lag 12 (AR estacional). Estos patrones sugieren como punto de partida `ARIMA(p,1,q)(P,1,Q)[12]`.
+
+---
+
+## Metodología
+
+### División train / test
+
+Se utiliza un esquema de validación hold-out estricto: los modelos se entrenan con datos históricos y se evalúan sobre un año completo no observado durante el entrenamiento.
+
+| Conjunto | Período | Observaciones |
+|---|---|---|
+| **Train** | Enero 2016 – Diciembre 2024 | 108 meses |
+| **Test** | Enero 2025 – Diciembre 2025 | 12 meses |
+
+### Modelos evaluados
+
+**Benchmarks** — sirven como línea base de comparación:
+
+| Modelo | Descripción |
+|---|---|
+| MEAN | Promedio histórico constante |
+| NAIVE | Último valor observado |
+| **SNAIVE** | Último valor del mismo mes del año anterior |
+| DRIFT | Random walk con tendencia lineal |
+
+SNAIVE es el benchmark relevante para series estacionales: cualquier modelo más complejo debe superarlo para justificar su uso.
+
+**Modelos estadísticos:**
+
+| Modelo | Descripción |
+|---|---|
+| ETS(A,A,A) | Error, tendencia y estacionalidad aditivos |
+| ETS(A,Ad,A) | Igual con tendencia amortiguada |
+| ETS auto | Selección automática por AICc |
+| ARIMA(1,1,0)(1,1,1)[12] | Especificación manual guiada por ACF/PACF |
+| **ARIMA auto** | Búsqueda exhaustiva por AICc (`stepwise = FALSE`) |
+
+### Métricas de evaluación
+
+$$\text{RMSE} = \sqrt{\frac{1}{h}\sum_{t=1}^{h}(y_t - \hat{y}_t)^2}$$
+
+$$\text{MAPE} = \frac{100}{h}\sum_{t=1}^{h}\left|\frac{y_t - \hat{y}_t}{y_t}\right|$$
+
+El RMSE penaliza errores grandes cuadráticamente (relevante para planificación de capacidad); el MAPE es interpretable como porcentaje independiente de la unidad.
+
+---
+
+## Resultados
+
+### Comparación de modelos
+
+```{r tabla-accuracy}
+tabla_final |>
+  rename(
+    "Modelo"  = Modelo,
+    "RMSE (GWh)" = RMSE,
+    "MAE (GWh)"  = MAE,
+    "MAPE (%)"   = MAPE,
+    "Tipo"    = Tipo
+  ) |>
+  kable(caption = "Accuracy en test set 2025 — todos los modelos (ordenado por RMSE)",
+        digits  = c(0, 1, 1, 2, 0)) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE) |>
+  column_spec(1, bold = TRUE) |>
+  row_spec(1, bold = TRUE, background = "#d4edda") |>   # resaltar ganador
+  row_spec(3, background = "#fff3cd")                    # resaltar SNAIVE
+```
+
+::: {.callout-important title="Hallazgo: ETS subestima la demanda post-2022"}
+Los tres modelos ETS obtienen un RMSE **mayor** que SNAIVE. La causa: la tendencia se aceleró entre 2022 y 2025 (+5–6% anual vs +3% en 2016–2019). ETS con tendencia aditiva promedia la tendencia histórica completa y subestima sistemáticamente la demanda reciente. ARIMA con diferenciación `d=1` es adaptativo al nivel reciente, lo que le permite seguir la aceleración sin sobre-suavizar.
+:::
+
+### Forecast vs demanda real 2025
+
+```{r fig-forecast, fig.cap="Forecast ARIMA_auto vs demanda real 2025. Bandas de confianza al 80% y 95%."}
+include_graphics(here("output", "figures", "12_forecast_vs_actual.png"))
+```
+
+### Perfil de errores mensual
+
+```{r fig-errores, fig.cap="Error mensual (Real − Forecast) y distribución del error para ARIMA_auto en 2025."}
+include_graphics(here("output", "figures", "13_error_distribution.png"))
+```
+
+Todos los errores son positivos (subestimación) excepto febrero (−1 GWh). La media del error es +25.5 GWh, lo que sugiere que el crecimiento de la demanda en 2025 fue marginalmente superior a lo que el patrón histórico 2016–2024 proyectaba. Este sesgo positivo es pequeño en términos relativos (~2% MAPE) y consistente con una economía en expansión.
+
+### Validación cruzada temporal
+
+Para una evaluación más robusta, se aplicó *time-series cross-validation* con ventanas de origen rodante (`stretch_tsibble`):
+
+| Parámetro | Valor |
+|---|---|
+| Tamaño mínimo del train | 60 meses (5 años) |
+| Paso entre ventanas | 6 meses |
+| Ventanas generadas | 9 |
+| Horizonte por ventana | 12 meses |
+
+```{r fig-cv, fig.cap="RMSE por horizonte de pronóstico bajo CV rolling origin. ARIMA_auto supera a SNAIVE en todos los horizontes."}
+include_graphics(here("output", "figures", "14_cv_accuracy.png"))
+```
+
+```{r tabla-cv}
+tibble(
+  Modelo     = c("ARIMA auto", "SNAIVE"),
+  `RMSE (GWh)` = c(50.4, 64.7),
+  `MAPE (%)`   = c(3.61, 5.19),
+  `Mejora`     = c("−22.1% vs SNAIVE", "—")
+) |>
+  kable(caption = "Accuracy promedio bajo CV rolling origin") |>
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE) |>
+  row_spec(1, bold = TRUE, background = "#d4edda")
+```
+
+La ventaja de ARIMA sobre SNAIVE es consistente en ambos esquemas de evaluación, lo que refuerza la validez de la selección.
+
+### Diagnóstico de residuos — ARIMA auto
+
+```{r fig-residuals, fig.cap="Diagnóstico de residuos del modelo ARIMA_auto. ACF dentro de bandas indica ausencia de autocorrelación significativa."}
+include_graphics(here("output", "figures", "10_best_model_residuals.png"))
+```
+
+Los residuos del modelo ARIMA_auto presentan:
+
+- **Distribución aproximadamente normal** centrada en cero
+- **ACF dentro de los límites de significancia** en la mayoría de los lags
+- **Sin estructura sistemática** en el tiempo
+
+Esto confirma que el modelo captura adecuadamente la información disponible en la serie.
+
+### Forecast final
+
+```{r fig-final, fig.cap="Forecast final para los meses restantes de 2026, entrenado con la serie completa 2016–2026."}
+include_graphics(here("output", "figures", "11_final_forecast.png"))
+```
+
+---
+
+## Conclusiones
+
+1. **La demanda eléctrica del SNI guatemalteco sigue una tendencia alcista sostenida**, con un crecimiento promedio del ~4.5% anual en el período post-COVID (2022–2025). El único quiebre estructural identificado fue el impacto de COVID-19 en 2020, del cual la demanda se recuperó en menos de un año.
+
+2. **ARIMA auto es el modelo ganador** con RMSE = 29 GWh (MAPE = 2.08%) en el test set 2025 — una mejora del 50.6% sobre el benchmark SNAIVE. La superioridad se confirma bajo cross-validation con múltiples ventanas de entrenamiento.
+
+3. **Los modelos ETS no logran superar a SNAIVE** en este contexto, debido a que la tendencia de crecimiento se aceleró post-2022. ETS promedia la tendencia histórica y subestima sistemáticamente la demanda reciente, mientras que ARIMA con diferenciación es más adaptativo.
+
+4. **El error promedio del modelo ganador (~2% MAPE) es suficientemente bajo** para informar decisiones de planificación operativa como compras de energía en el mercado spot y programación de mantenimiento de plantas.
+
+---
+
+## Reproducibilidad
+
+Todo el análisis es reproducible ejecutando los scripts en orden desde la raíz del proyecto:
+
+```r
+# Requiere: R ≥ 4.3, paquetes fpp3, tidyverse, readxl, here, patchwork
+source("R/01_import_clean.R")
+source("R/02_eda.R")
+source("R/03_benchmark_models.R")
+source("R/04_ets_arima.R")
+source("R/05_evaluation.R")
+quarto::quarto_render("report/analysis.qmd")
+```
+
+Los datos fuente (archivos `GM*.xls/xlsx` del AMM) deben ubicarse en `data/raw/`.
+
+---
+
+## Referencias
+
+- Hyndman, R.J. & Athanasopoulos, G. (2021). *Forecasting: Principles and Practice* (3rd ed). OTexts. [https://otexts.com/fpp3/](https://otexts.com/fpp3/)
+- Administrador del Mercado Mayorista (AMM). *Despacho de Carga Ejecutado del Sistema Nacional Interconectado*. Guatemala. [https://www.amm.org.gt](https://www.amm.org.gt)
+- Wang, E., Cook, D. & Hyndman, R.J. (2020). A new tidy data structure to support exploration and modeling of temporal data. *Journal of Computational and Graphical Statistics*, 29(3), 466–478.
+
+---
+
+*Documento generado con [Quarto](https://quarto.org) y [R](https://www.r-project.org). Código fuente disponible en GitHub.*
