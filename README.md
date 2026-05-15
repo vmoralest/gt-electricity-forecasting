@@ -17,6 +17,11 @@ This project builds and evaluates statistical forecasting models for the monthly
 
 ---
 
+## 📄 Report
+👉 [View full analysis report](https://vmoralest.github.io/gt-electricity-forecasting/analysis.html)
+
+---
+
 ## Results at a glance
 
 | Model | RMSE (GWh) | MAPE (%) | vs SNAIVE |
